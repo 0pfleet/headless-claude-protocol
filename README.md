@@ -1,204 +1,229 @@
-# Headless Claude Code Protocol
+# Claude-in-a-Box
 
-A file-based protocol for controlling Claude Code without terminal access. Designed for headless environments, CI pipelines, and remote agent control.
+Run Claude Code in a sandboxed container, controlled via HTTP with SSE streaming. Designed for autonomous backlog processing, bug triage, and CI pipelines.
 
 ## The Problem
 
-Claude Code (and most interactive tools) expect stdin for user input. When running in containers, CI, or remotely, there's no terminal to type into. Blocking on stdin causes deadlocks.
+Claude Code expects a terminal. You want to:
+- Run it in a container (sandboxed, reproducible)
+- Send it tasks from your backlog (Linear, GitHub Issues)
+- Watch progress in real-time
+- Let it work autonomously while you sleep
 
 ## The Solution
 
-Replace stdin/stdout with append-only files:
-- **You write** → `commands.jsonl`
-- **Claude responds** → `output.jsonl`
-- Agent polls files instead of blocking on stdin
+```
+┌─────────────────────────────────────────────────────────┐
+│  Docker Container                                       │
+│  ┌───────────────┐    ┌──────────────┐                 │
+│  │ Claude Code   │◄──►│ Task Server  │◄── HTTP :8080   │
+│  │ (sandboxed)   │    │ (SSE stream) │                 │
+│  └───────────────┘    └──────────────┘                 │
+│         │                                               │
+│         ▼                                               │
+│    /workspace (your code, mounted read-write)          │
+└─────────────────────────────────────────────────────────┘
+         ▲
+         │
+   ┌─────┴─────┐
+   │  Linear   │  ◄── Worker pulls issues, posts results
+   └───────────┘
+```
 
 ## Quick Start
 
-**Terminal 1 - Start the wrapper:**
-```bash
-./claude_wrapper.py
-```
-
-**Terminal 2 - Send tasks and watch output:**
-```bash
-./send_task.py "Create a Python function that calculates fibonacci numbers"
-./watch_output.py
-```
-
-## Scripts
-
-| Script | Purpose |
-|--------|---------|
-| `claude_wrapper.py` | Main wrapper - runs Claude Code headlessly |
-| `send_task.py` | Send tasks to the wrapper |
-| `watch_output.py` | Watch Claude's responses |
-| `protocol.py` | Core protocol library |
-| `respond.py` | Interactive responder (for demo agent) |
-
-## Usage
-
-### Start the Wrapper
+### 1. Run Locally (no Docker)
 
 ```bash
-# Foreground (see logs)
-./claude_wrapper.py
+# Install dependencies
+pip install aiohttp aiofiles httpx
 
-# Background
-nohup ./claude_wrapper.py > wrapper.log 2>&1 &
+# Start server
+export ANTHROPIC_API_KEY="sk-..."
+./server.py
 
-# One-shot mode (single prompt, then exit)
-./claude_wrapper.py --once "What files are in this directory?"
+# In another terminal, send a task
+./client.py "List all Python files and summarize what they do"
 ```
 
-### Send Tasks
+### 2. Run with Docker
 
 ```bash
-# Simple task
-./send_task.py "Fix the bug in main.py"
+# Build and run
+export ANTHROPIC_API_KEY="sk-..."
+export WORKSPACE_PATH="/path/to/your/codebase"
+docker compose up
 
-# With working directory
-./send_task.py --workdir /path/to/project "Run the tests"
-
-# From stdin (useful for long prompts)
-cat prompt.txt | ./send_task.py --stdin
-
-# Stop the wrapper
-./send_task.py --abort
+# Send tasks
+./client.py "Fix the failing tests"
 ```
 
-### Watch Output
+### 3. With Linear Integration
 
 ```bash
-# Live watch (like tail -f)
-./watch_output.py
+# Set up
+export LINEAR_API_KEY="lin_api_..."
+export ANTHROPIC_API_KEY="sk-..."
+export WORKSPACE_PATH="/path/to/your/codebase"
 
-# Last N responses
-./watch_output.py --last 3
+# Start with Linear worker
+docker compose --profile with-linear up
 
-# Specific response by ID
-./watch_output.py --id cmd_abc123
-
-# Just show status
-./watch_output.py --status
+# Or run worker manually
+./linear_worker.py --daemon --label claude
 ```
 
-### Raw File Access
+## API
+
+### POST /task
+Submit a task and receive SSE stream of progress.
 
 ```bash
-# Send task directly
-echo '{"id":"t1","type":"task","task":"List files"}' >> commands.jsonl
-
-# Read latest response
-tail -1 output.jsonl | jq -r '.response'
-
-# Watch status
-watch -n1 cat status.json
+curl -N -X POST http://localhost:8080/task \
+  -H "Content-Type: application/json" \
+  -d '{"prompt": "Fix the bug in auth.py"}'
 ```
 
-## Protocol Files
+**SSE Events:**
+```
+event: start
+data: {"task_id": "task_abc123", "prompt": "..."}
 
-| File | Direction | Purpose |
-|------|-----------|---------|
-| `commands.jsonl` | You → Agent | Tasks and commands |
-| `output.jsonl` | Agent → You | Claude's responses |
-| `status.json` | Agent → You | Current state (idle/working) |
-| `log.jsonl` | Agent → You | Activity log |
+event: output
+data: {"line": "Looking at auth.py..."}
 
-### Command Format
-
-```json
-{"id": "cmd_001", "type": "task", "task": "Your prompt here", "workdir": "/optional/path"}
-{"id": "cmd_002", "type": "abort"}
+event: done
+data: {"task_id": "task_abc123", "exit_code": 0, "state": "completed"}
 ```
 
-### Output Format
-
-```json
-{
-  "id": "cmd_001",
-  "timestamp": "2024-01-15T10:30:00",
-  "prompt": "Your prompt",
-  "response": "Claude's response...",
-  "exit_code": 0
-}
-```
-
-### Status Format
-
-```json
-{
-  "state": "working",
-  "task": "Fix the bug...",
-  "detail": null,
-  "updated_at": "2024-01-15T10:30:00"
-}
-```
-
-## Headless / CI Usage
+### GET /status
+Current agent status.
 
 ```bash
-# In CI script
-cd /workspace
-nohup ./claude_wrapper.py &
-sleep 2
-
-# Send task
-./send_task.py "Run tests and fix any failures"
-
-# Wait for completion (poll status)
-while [ "$(jq -r .state status.json)" = "working" ]; do
-  sleep 5
-done
-
-# Get result
-RESPONSE=$(tail -1 output.jsonl | jq -r '.response')
-EXIT_CODE=$(tail -1 output.jsonl | jq -r '.exit_code')
-
-echo "$RESPONSE"
-exit $EXIT_CODE
+curl http://localhost:8080/status
+# {"state": "running", "task_id": "...", "prompt": "..."}
 ```
 
-## How It Works
+### POST /stop
+Stop the current task.
 
-1. **Non-interactive by default**: The wrapper sets environment variables that disable prompts:
-   - `DEBIAN_FRONTEND=noninteractive`
-   - `GIT_TERMINAL_PROMPT=0`
-   - `PIP_NO_INPUT=1`
+```bash
+curl -X POST http://localhost:8080/stop
+```
 
-2. **Auto-approve permissions**: Uses `--dangerously-skip-permissions` so Claude can run commands and edit files without asking.
+### GET /history
+Recent task history.
 
-3. **Poll, don't block**: Wrapper loops checking `commands.jsonl` every 2 seconds instead of blocking on stdin.
+```bash
+curl http://localhost:8080/history?limit=10
+```
 
-4. **Atomic writes**: Status updates use write-to-temp + rename for crash safety.
+## CLI Client
 
-## Environment Variables
+```bash
+# Send a task (streams output to terminal)
+./client.py "Refactor the database module"
 
-| Variable | Default | Purpose |
-|----------|---------|---------|
-| `AGENT_PROTOCOL_DIR` | `.` | Directory for protocol files |
-| `AGENT_POLL_INTERVAL` | `1.0` | Seconds between polls |
-| `AGENT_POLL_TIMEOUT` | `3600` | Max seconds to wait for response |
+# Check status
+./client.py status
 
-## Demo Agents
+# Stop current task
+./client.py stop
 
-Two demo agents are included that use the lower-level protocol (for building custom agents):
+# View history
+./client.py history
 
-- `demo_agent.py` - Simple demo showing request/response flow
-- `coding_agent.py` - More realistic agent with git/file operations
+# Connect to remote server
+./client.py --server http://my-server:8080 "Run tests"
+```
 
-These use `protocol.py` directly and support interactive confirmation via `requests.jsonl`/`responses.jsonl`.
+## Linear Integration
+
+The `linear_worker.py` pulls issues from your Linear backlog and sends them to Claude.
+
+```bash
+# Show pending issues
+./linear_worker.py --dry-run
+
+# Process one issue
+./linear_worker.py
+
+# Process issues with specific label
+./linear_worker.py --label "claude-ready"
+
+# Run as daemon (continuous processing)
+./linear_worker.py --daemon --interval 120
+```
+
+**Workflow:**
+1. Worker finds issues in Backlog/Todo state
+2. Moves issue to "In Progress"
+3. Sends issue to Claude with context
+4. Posts Claude's response as comment
+5. Moves to "In Review" (success) or back to "Todo" (failed)
+
+**Recommended Labels:**
+- `claude` or `claude-ready` - Issues Claude should pick up
+- Use `--label` flag to filter
+
+## Configuration
+
+### Environment Variables
+
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `ANTHROPIC_API_KEY` | Yes | Your Anthropic API key |
+| `LINEAR_API_KEY` | For Linear | Linear API key |
+| `WORKSPACE_DIR` | No | Workspace path (default: /workspace) |
+| `AGENT_PORT` | No | Server port (default: 8080) |
+| `AGENT_HOST` | No | Server host (default: 0.0.0.0) |
+| `LINEAR_TEAM_ID` | No | Filter Linear issues by team |
+
+### Docker Compose
+
+```bash
+# Just the server
+docker compose up claude-box
+
+# Server + Linear worker
+docker compose --profile with-linear up
+
+# Custom workspace
+WORKSPACE_PATH=/my/code docker compose up
+```
+
+## Files
+
+| File | Purpose |
+|------|---------|
+| `server.py` | HTTP server with SSE streaming |
+| `client.py` | CLI client |
+| `linear_worker.py` | Linear backlog integration |
+| `Dockerfile` | Container image |
+| `docker-compose.yml` | Easy deployment |
+| `protocol.py` | Low-level file-based protocol (for custom agents) |
+
+## Safety Notes
+
+⚠️ **This runs with `--dangerously-skip-permissions`** - Claude can execute any command and modify any file in the workspace.
+
+Mitigations:
+- Run in Docker (isolated from host)
+- Mount workspace read-only if you just want analysis: `-v /code:/workspace:ro`
+- Set resource limits in docker-compose
+- Review Claude's output before merging changes
 
 ## Limitations
 
-- **No conversation memory**: Each task is independent. Claude doesn't remember previous tasks.
-- **No streaming**: You get the full response when done, not incrementally.
-- **Trust required**: `--dangerously-skip-permissions` means Claude can do anything.
+- **No conversation memory** - Each task is independent
+- **Single task at a time** - Queue your own tasks
+- **No auth** - Add a reverse proxy for production
 
 ## Future Ideas
 
-- [ ] Session persistence (conversation memory across tasks)
-- [ ] Webhook notifications when tasks complete
-- [ ] Rate limiting / queue management
-- [ ] Response streaming via chunked files
-- [ ] Docker container for full sandboxing
+- [ ] Session persistence (memory across tasks)
+- [ ] Task queue with priorities
+- [ ] GitHub Issues integration
+- [ ] Web dashboard
+- [ ] Webhooks for task completion
+- [ ] Read-only mode for analysis tasks

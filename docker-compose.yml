@@ -1,0 +1,34 @@
+version: "3.8"
+
+services:
+  claude-box:
+    build: .
+    ports:
+      - "8080:8080"
+    volumes:
+      # Mount your codebase here
+      - ${WORKSPACE_PATH:-.}:/workspace
+    environment:
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      - WORKSPACE_DIR=/workspace
+      - AGENT_PORT=8080
+    restart: unless-stopped
+    # Resource limits for safety
+    deploy:
+      resources:
+        limits:
+          cpus: "2"
+          memory: 4G
+
+  # Optional: Linear worker that processes backlog
+  linear-worker:
+    build: .
+    command: python3 linear_worker.py --daemon --label claude
+    depends_on:
+      - claude-box
+    environment:
+      - LINEAR_API_KEY=${LINEAR_API_KEY}
+      - CLAUDE_BOX_SERVER=http://claude-box:8080
+    restart: unless-stopped
+    profiles:
+      - with-linear  # Only starts with: docker compose --profile with-linear up
